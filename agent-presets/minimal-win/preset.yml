@@ -1,0 +1,2 @@
+name: 极简模式 (Windows)
+description: 仅提供 pwsh 与 str_replace_editor 的双工具编码 Agent，Windows 原生版（出厂极简模式的持久 bash 依赖 PTY，在 Windows 上不可用）。

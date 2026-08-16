@@ -1,0 +1,49 @@
+# The `minimal` agent preset, adapted for Windows (user-authored copy).
+#
+# The shipped `minimal` preset cannot run on Windows: its only shell tool is a
+# persistent bash PTY, and the subprocess layer's terminal inspection is only
+# implemented for linux/darwin — on win32 every terminal spawn throws
+# "subprocess-local: terminal inspection is unsupported on platform win32".
+#
+# This copy keeps the two-tool shape (one shell + str_replace_editor) but uses
+# the Windows-native non-persistent `pwsh` tool — the same row the `standard`
+# preset mounts on win32 — which spawns `pwsh -Command` per call through the
+# host executor and needs no PTY. Trade-off vs the shipped preset: each call is
+# a fresh process, so cwd and exported variables do NOT persist across calls.
+#
+# The persona is the complete system prompt, so global identity, Web orientation,
+# tool guidance, and later assembly listeners cannot add prompt text. Runtime
+# context snapshots are suppressed for this preset, and the model composes only
+# `pwsh` and `str_replace_editor`. Context compaction is absent.
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: You are a helpful software engineer assistant.
+    complete: true
+    includeRuntimeContext: false
+
+# Windows-native shell tool: per-call `pwsh -Command` through the host executor.
+# Same row the `standard` preset mounts on win32; disabled elsewhere because the
+# host only backs it with a PowerShell executor on Windows.
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+# The bare local filesystem shadows the host's sandboxed provider only for this
+# preset. The editor shares that realm and requires absolute paths.
+- id: filesystem
+  name: cordis:group
+  group: true
+  isolate:
+    fs: true
+  config:
+    - id: fs-local
+      name: '@deepseek-ai/dsh-fs-local'
+      config:
+        cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+    - id: str-replace-editor
+      name: '@deepseek-ai/dsh-tool-str-replace-editor'
+      config:
+        maxOutputChars: 16000

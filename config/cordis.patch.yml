@@ -1,0 +1,43 @@
+# dsh profile patch layer (ascii-only)
+# Enabled plugins
+- insert:
+    # schedule tools
+    - id: schedule
+      name: '@deepseek-ai/dsh-schedule'
+
+    # time context
+    - id: time-context
+      name: '@deepseek-ai/dsh-time-context'
+      config:
+        timeZone: Asia/Shanghai
+        refreshIntervalMs: 60000
+
+# MCP server example (commented out)
+# - insert:
+#     - id: mcp-github
+#       name: '@deepseek-ai/dsh-mcp-client'
+#       config:
+#         serverName: github
+#         transport: stdio
+#         command: npx
+#         args: ['-y', '@modelcontextprotocol/server-github']
+#         env:
+#           GITHUB_TOKEN: !!js process.env.GITHUB_TOKEN
+# image-bridge
+- insert:
+    - id: image-bridge
+      name: ./image-bridge.mjs?rev=9
+      config:
+        modlens: C:\Users\32169\AppData\Roaming\npm\modlens.cmd
+        ocrTimeoutMs: 90000
+        modlensTimeoutMs: 180000
+        logFile: C:\Users\32169\.dsh\profiles\web\image-bridge.log
+
+# ─── image-display：对话内联图片 ────────────────────────────────────────────
+# 提供 show_image（显示工作区图片）和 generate_image（AI 文生图）两个工具，
+# 生成的图片直接渲染在对话回复里（ChatGPT 式），无需去文件夹打开。
+- insert:
+    - id: image-display
+      name: ./image-display.mjs?rev=6
+
+

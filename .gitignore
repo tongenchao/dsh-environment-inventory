@@ -1,0 +1,13 @@
+# 排除项
+node_modules/
+*.log
+*.log.*
+.trash/
+_trash/
+.git/
+.npm-cache/
+pw-browsers/
+sessions/
+storages/
+.credentials.yaml
+.DS_Store

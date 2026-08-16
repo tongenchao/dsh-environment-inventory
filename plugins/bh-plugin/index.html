@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>事件视界 · 引力透镜黑洞 · 电影宽银幕</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;overflow:hidden;height:100%}
+  canvas{display:block;width:100vw;height:100vh;object-fit:contain;background:#000}
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<script>
+(function(){
+'use strict';
+/* ============================================================
+ * 史诗级超大质量黑洞 · Canvas 2D 单文件渲染
+ * 物理/构图规划见同目录 README.md
+ * ============================================================ */
+
+// ---------- 配置 ----------
+const CFG = {
+  W: 1920, H: 1080,            // 逻辑分辨率（16:9）
+  FORCE_8K: false,             // true -> 7680x4320（用于出片/截图）
+  MAX_DPR: 2,                  // devicePixelRatio 上限
+  RS: 30,                      // px / Rs @1920 宽
+  INCL: 30 * Math.PI / 180,    // 吸积盘倾角（rad）：22->30°，倾斜感更明显且远侧弧线仍清晰
+  SHADOW_IN: 2.52,             // Rs 阴影本体半径
+  SHADOW_OUT: 2.60,            // Rs 阴影软边
+  PHOTON: 2.60,                // Rs 光子环峰值半径
+  LENS_E: 2.90,                // Rs 背景透镜爱因斯坦半径
+  DISK_IN: 3.00, DISK_OUT: 13.0,
+  BETA: 0.30,                  // 多普勒轨道速度因子
+  DISK_SECTORS: 220,
+  DUST_N: 300,                 // 螺旋吸入尘埃粒子数
+  AMBIENT_N: 70                // 前景漂浮微尘
+};
+
+const TAU = Math.PI * 2;
+const clamp = (v,a,b)=> v<a?a:(v>b?b:v);
+const lerp  = (a,b,f)=> a+(b-a)*f;
+const rnd   = (a,b)=> a+Math.random()*(b-a);
+
+// 吸积盘径向色带：t=1 内缘白热 -> t=0 外缘深红
+const RAMP = [
+  [1.00,242,246,255],[0.90,255,233,200],[0.78,255,196,106],
+  [0.62,255,138, 42],[0.48,217, 79, 20],[0.34,156, 42, 12],
+  [0.20, 94, 18,  5],[0.00, 42,  6,  2]
+];
+function ramp(t){
+  t = clamp(t,0,1);
+  for(let i=0;i<RAMP.length-1;i++){
+    const s0=RAMP[i], s1=RAMP[i+1];
+    if(t<=s0[0]){
+      const f=(t-s0[0])/(s1[0]-s0[0]);
+      return [s0[1]+(s1[1]-s0[1])*f, s0[2]+(s1[2]-s0[2])*f, s0[3]+(s1[3]-s0[3])*f];
+    }
+  }
+  const s=RAMP[RAMP.length-1];
+  return [s[1],s[2],s[3]];
+}
+
+// ---------- 全局状态 ----------
+const canvas = document.getElementById('scene');
+let ctx, W, H, DPR, RS, cx, cy, cosI;
+let S = {};                       // 离屏静态层
+let dust = [], ambient = [];
+let lastT = 0;
+
+function makeCanvas(w, h, scale){
+  const c = document.createElement('canvas');
+  c.width  = Math.max(1, Math.round(w*scale));
+  c.height = Math.max(1, Math.round(h*scale));
+  const g = c.getContext('2d');
+  g.setTransform(scale,0,0,scale,0,0);
+  return c;
+}
+
+// ---------- 初始化 ----------
+function init(){
+  W  = CFG.FORCE_8K ? 7680 : CFG.W;
+  H  = CFG.FORCE_8K ? 4320 : CFG.H;
+  DPR = Math.min(window.devicePixelRatio || 1, CFG.MAX_DPR);
+  canvas.width  = W*DPR;
+  canvas.height = H*DPR;
+  ctx = canvas.getContext('2d');
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  cx = W/2; cy = H/2;
+  RS  = CFG.RS * (W/1920);
+  cosI = Math.cos(CFG.INCL);
+  // 8K 下辅助层降采样控内存（柔和渐变层，缩放无碍）
+  const auxF = (W>4096) ? 0.5 : 1;
+
+  // 加载提示
+  ctx.fillStyle = '#334';
+  ctx.font = '28px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('正在弯曲时空……', cx, cy);
+
+  buildStatics(auxF);
+  initParticles();
+  render(0, 0.016);              // 首帧同步渲染（headless 截图兼容）
+  requestAnimationFrame(loop);
+}
+
+// ---------- 静态层烘焙 ----------
+function buildStatics(auxF){
+  // 1) 银河源场
+  S.src = makeCanvas(W, H, DPR);
+  drawSourceField(S.src.getContext('2d'));
+
+  // 2) 透镜化背景（逐像素逆映射）
+  S.lensed = makeCanvas(W, H, DPR);
+  lensPass(S.src, S.lensed);
+  bakeRingGlow(S.lensed.getContext('2d'));
+
+  // 3) 吸积盘（全盘 / 近侧盘）
+  S.diskFull = makeCanvas(W, H, DPR*auxF);
+  drawDisk(S.diskFull.getContext('2d'), false);
+  S.diskNear = makeCanvas(W, H, DPR*auxF);
+  drawDisk(S.diskNear.getContext('2d'), true);
+
+  // 4) 暗角 / 电影条 / 颗粒
+  S.vign = makeCanvas(W, H, DPR*auxF);
+  drawVignette(S.vign.getContext('2d'));
+  S.letter = makeCanvas(W, H, DPR*auxF);
+  drawLetterbox(S.letter.getContext('2d'));
+  S.grain = makeCanvas(384, 384, 1);
+  drawGrainTexture(S.grain.getContext('2d'));
+}
+
+/* ---------- 1) 银河源场 ---------- */
+function drawSourceField(g){
+  g.fillStyle = '#04060c';
+  g.fillRect(0,0,W,H);
+  g.globalCompositeOperation = 'lighter';
+
+  // 中心冷色微光
+  let gr = g.createRadialGradient(cx,cy,0,cx,cy,Math.max(W,H)*0.6);
+  gr.addColorStop(0,'rgba(18,28,64,0.38)');
+  gr.addColorStop(1,'rgba(0,0,0,0)');
+  g.fillStyle = gr; g.fillRect(0,0,W,H);
+
+  // 星云团
+  const NEB = [
+    [-0.32,-0.40,0.55,'rgba(28,58,140,0.10)'],
+    [ 0.42,-0.25,0.45,'rgba(90,36,140,0.09)'],
+    [ 0.10, 0.55,0.50,'rgba(20,110,130,0.09)'],
+    [-0.55, 0.30,0.40,'rgba(140,60,30,0.05)'],
+    [ 0.30, 0.10,0.60,'rgba(40,60,160,0.08)'],
+    [-0.10,-0.65,0.42,'rgba(80,50,140,0.07)'],
+    [ 0.60, 0.45,0.38,'rgba(30,90,120,0.07)'],
+    [-0.65,-0.10,0.35,'rgba(60,40,110,0.06)'],
+    [ 0.00,-0.10,0.50,'rgba(120,70,60,0.04)'],
+    [-0.20, 0.20,0.45,'rgba(40,50,120,0.07)']
+  ];
+  for(const nb of NEB){
+    const bx = cx + nb[0]*W, by = cy + nb[1]*H, br = nb[2]*Math.max(W,H)*0.5;
+    const ng = g.createRadialGradient(bx,by,0,bx,by,br);
+    ng.addColorStop(0,nb[3]);
+    ng.addColorStop(1,'rgba(0,0,0,0)');
+    g.fillStyle = ng;
+    g.fillRect(bx-br,by-br,br*2,br*2);
+  }
+
+  // 银河带（源空间斜带，最近处距中心 1.2 Rs -> 透镜成环）
+  const phi = 0.35, bandW = 10*RS, bandOff = 1.2*RS;
+  g.save();
+  g.translate(cx,cy); g.rotate(phi);
+  let lg = g.createLinearGradient(0,-bandW,0,bandW);
+  lg.addColorStop(0,'rgba(230,200,170,0)');
+  lg.addColorStop(0.5,'rgba(230,200,170,0.12)');
+  lg.addColorStop(1,'rgba(230,200,170,0)');
+  g.fillStyle = lg; g.fillRect(-2600, bandOff-bandW, 5200, bandW*2);
+  lg = g.createLinearGradient(0,-bandW*0.42,0,bandW*0.42);
+  lg.addColorStop(0,'rgba(255,236,205,0)');
+  lg.addColorStop(0.5,'rgba(255,236,205,0.07)');
+  lg.addColorStop(1,'rgba(255,236,205,0)');
+  g.fillStyle = lg; g.fillRect(-2600, bandOff-bandW*0.42, 5200, bandW*0.84);
+  g.restore();
+
+  // 星点
+  const cosP = Math.cos(phi), sinP = Math.sin(phi);
+  const N = 1050;
+  for(let i=0;i<N;i++){
+    const x = Math.random()*W, y = Math.random()*H;
+    const bx = (x-cx)*cosP + (y-cy)*sinP;
+    const by =-(x-cx)*sinP + (y-cy)*cosP;
+    const inBand = Math.abs(by-bandOff) < bandW;
+    if(!inBand && Math.random()<0.45) continue;   // 带外稀疏
+    const roll = Math.random();
+    let col, size, bright;
+    if(inBand && roll<0.62){
+      const c = Math.random();
+      col   = c<0.55 ? [240,235,255] : c<0.85 ? [255,244,225] : [255,214,170];
+      size  = rnd(0.6,2.2); bright = Math.random()<0.13;
+    } else {
+      const c = Math.random();
+      col   = c<0.50 ? [205,218,255] : c<0.85 ? [235,240,255] : [255,206,190];
+      size  = rnd(0.5,1.7); bright = Math.random()<0.05;
+    }
+    if(bright) size += rnd(1.2,2.6);
+    if(size < 1.3){
+      g.fillStyle = 'rgb('+col[0]+','+col[1]+','+col[2]+')';
+      g.fillRect(x,y,size,size);
+    } else {
+      const r = size*3.2;
+      const sg = g.createRadialGradient(x,y,0,x,y,r);
+      sg.addColorStop(0,'rgba('+col[0]+','+col[1]+','+col[2]+',0.85)');
+      sg.addColorStop(1,'rgba(0,0,0,0)');
+      g.fillStyle = sg; g.fillRect(x-r,y-r,r*2,r*2);
+      g.fillStyle = 'rgb('+col[0]+','+col[1]+','+col[2]+')';
+      g.fillRect(x-size/2,y-size/2,size,size);
+      if(bright){                                   // 衍射星芒（透镜后会被剪切拉长）
+        const L = 3+Math.random()*7;
+        g.strokeStyle = 'rgba('+col[0]+','+col[1]+','+col[2]+',0.7)';
+        g.lineWidth = 1;
+        g.beginPath();
+        g.moveTo(x-L,y); g.lineTo(x+L,y);
+        g.moveTo(x,y-L); g.lineTo(x,y+L);
+        g.stroke();
+      }
+    }
+  }
+}
+
+/* ---------- 2) 逐像素透镜逆映射 ---------- */
+function lensPass(srcC, outC){
+  const sw = srcC.width, sh = srcC.height;
+  const sd = srcC.getContext('2d').getImageData(0,0,sw,sh).data;
+  const out = outC.getContext('2d').createImageData(sw,sh);
+  const od = out.data;
+  const LE = CFG.LENS_E, LE2 = LE*LE;
+  const Rsi = CFG.SHADOW_IN, Rso = CFG.SHADOW_OUT;
+  let idx = 0;
+  for(let py=0; py<sh; py++){
+    const v = (py/DPR - cy)/RS;
+    for(let px=0; px<sw; px++){
+      const u = (px/DPR - cx)/RS;
+      const b2 = u*u + v*v;
+      const b = Math.sqrt(b2);
+      let r,g,bv;
+      if(b < Rsi){ r=0; g=0; bv=0; }
+      else {
+        const f = 1 - LE2/b2;
+        const su = u*f, sv = v*f;
+        let R,G,B;
+        // 切向 3 点采样（爱因斯坦环弧化）
+        if(b < 6){
+          const inv = 1/b, tx = -v*inv, ty = u*inv;
+          const eps = 0.5 + 0.8*(b-2.5);
+          let s1 = sample(su,sv), s2 = sample(su+eps*tx,sv+eps*ty), s3 = sample(su-eps*tx,sv-eps*ty);
+          R = (s1[0]+s2[0]+s3[0])/3; G = (s1[1]+s2[1]+s3[1])/3; B = (s1[2]+s2[2]+s3[2])/3;
+        } else {
+          const s = sample(su,sv); R=s[0]; G=s[1]; B=s[2];
+        }
+        // 阴影软边
+        if(b < Rso){
+          const f2 = (b-Rsi)/(Rso-Rsi);
+          R*=f2; G*=f2; B*=f2;
+        }
+        // 环区放大率增强 + 暖辉光
+        const db = b-LE;
+        if(db > -2.2 && db < 2.2){
+          const mag = 1 + 2.0*Math.exp(-(db*db)/(0.5*0.5));
+          R*=mag; G*=mag; B*=mag;
+          const wm = 0.30*Math.exp(-(db*db)/(0.9*0.9));
+          R = lerp(R,255,wm); G = lerp(G,205,wm); B = lerp(B,150,wm);
+        }
+        // 远场渐暗（聚焦中心）
+        if(b > 15){
+          const f2 = clamp(1-(b-15)/9, 0.30, 1);
+          R*=f2; G*=f2; B*=f2;
+        }
+        r = R>255?255:R; g = G>255?255:G; bv = B>255?255:B;
+      }
+      od[idx]   = r|0;
+      od[idx+1] = g|0;
+      od[idx+2] = bv|0;
+      od[idx+3] = 255;
+      idx += 4;
+    }
+  }
+  outC.getContext('2d').putImageData(out,0,0);
+
+  function sample(su,sv){
+    const sx = clamp(Math.round((cx+su*RS)*DPR), 0, sw-1);
+    const sy = clamp(Math.round((cy+sv*RS)*DPR), 0, sh-1);
+    const i = (sy*sw + sx)*4;
+    return [sd[i], sd[i+1], sd[i+2]];
+  }
+}
+
+/* 环区辉光烘焙（加在透镜背景上） */
+function bakeRingGlow(g){
+  g.globalCompositeOperation = 'lighter';
+  let gr = g.createRadialGradient(cx,cy,0,cx,cy,3.4*RS);
+  gr.addColorStop(0.00,'rgba(255,170,110,0)');
+  gr.addColorStop(0.74,'rgba(255,170,110,0)');
+  gr.addColorStop(0.78,'rgba(255,205,150,0.22)');
+  gr.addColorStop(0.88,'rgba(255,180,120,0.10)');
+  gr.addColorStop(1.00,'rgba(255,150,90,0)');
+  g.fillStyle = gr; g.beginPath(); g.arc(cx,cy,3.4*RS,0,TAU); g.fill();
+  gr = g.createRadialGradient(cx,cy,0,cx,cy,7.0*RS);
+  gr.addColorStop(0.00,'rgba(255,150,90,0)');
+  gr.addColorStop(0.42,'rgba(255,150,90,0.09)');
+  gr.addColorStop(0.62,'rgba(255,170,110,0.05)');
+  gr.addColorStop(1.00,'rgba(255,150,90,0)');
+  g.fillStyle = gr; g.beginPath(); g.arc(cx,cy,7.0*RS,0,TAU); g.fill();
+  // 多普勒冷暖不对称（左蓝右红）
+  let dg = g.createRadialGradient(cx-3.2*RS,cy,0,cx-3.2*RS,cy,2.2*RS);
+  dg.addColorStop(0,'rgba(120,170,255,0.12)'); dg.addColorStop(1,'rgba(0,0,0,0)');
+  g.fillStyle = dg; g.fillRect(cx-3.2*RS-2.2*RS,cy-2.2*RS,4.4*RS,4.4*RS);
+  dg = g.createRadialGradient(cx+3.2*RS,cy,0,cx+3.2*RS,cy,2.2*RS);
+  dg.addColorStop(0,'rgba(255,90,60,0.10)'); dg.addColorStop(1,'rgba(0,0,0,0)');
+  g.fillStyle = dg; g.fillRect(cx+3.2*RS-2.2*RS,cy-2.2*RS,4.4*RS,4.4*RS);
+}
+
+/* ---------- 3) 吸积盘 ---------- */
+function drawDisk(g, nearOnly){
+  g.save();
+  if(nearOnly){ g.beginPath(); g.rect(0, cy, W, H); g.clip(); }
+  // 盘体辉光
+  g.globalCompositeOperation = 'lighter';
+  let gr = g.createRadialGradient(cx,cy,0,cx,cy,CFG.DISK_OUT*RS);
+  gr.addColorStop(0.00,'rgba(255,160,80,0.16)');
+  gr.addColorStop(0.75,'rgba(255,120,60,0.07)');
+  gr.addColorStop(1.00,'rgba(0,0,0,0)');
+  g.fillStyle = gr; g.beginPath(); g.arc(cx,cy,CFG.DISK_OUT*RS,0,TAU); g.fill();
+  g.globalCompositeOperation = 'source-over';
+
+  const N = CFG.DISK_SECTORS, cI = cosI;
+  const rIn = CFG.DISK_IN*RS, rOut = CFG.DISK_OUT*RS;
+  const FAR_DIM = 0.82;   // 远侧盘面轻微压暗（透视/透镜取舍）
+  for(let k=0;k<N;k++){
+    const a0 = k/N*TAU, a1 = (k+1)/N*TAU, aM = (a0+a1)/2;
+    // 多普勒：a=π（左）接近增亮，a=0（右）远离变暗
+    const boost = Math.pow(1 - CFG.BETA*Math.cos(aM), 3);
+    const farDim = (Math.sin(aM) < 0) ? FAR_DIM : 1;   // 远侧（屏幕上方位）压暗
+    // 压扁空间内做径向渐变：内缘白热 -> 外缘暗红（每扇区独立，叠加多普勒）
+    g.save();
+    g.translate(cx,cy);
+    g.scale(1, cI);
+    const sg = g.createRadialGradient(0,0, rIn, 0,0, rOut);
+    const STOPS = 6;
+    for(let i=0;i<STOPS;i++){
+      const t = i/(STOPS-1);                       // 0=外缘 … 1=内缘
+      const c = ramp(t);
+      let R=c[0]*boost*farDim, G=c[1]*boost*farDim, B=c[2]*boost*farDim;
+      const w = clamp((boost-1)*0.5, 0, 0.7) * t;  // 白色混合随温度衰减：仅内缘白热，外缘保留红橙
+      R += (255-R)*w; G += (255-G)*w; B += (255-B)*w;
+      const d = clamp((1-boost)*0.4, 0, 0.55);     // 远离侧 -> 暗红
+      R += (90-R)*d; G += (16-G)*d; B += (8-B)*d;
+      sg.addColorStop(1-t, 'rgb('+(R|0)+','+(G|0)+','+(B|0)+')');
+    }
+    g.fillStyle = sg;
+    g.beginPath();
+    g.moveTo(Math.cos(a1)*rOut, Math.sin(a1)*rOut);
+    g.arc(0,0, rOut, a1, a0, true);
+    g.lineTo(Math.cos(a0)*rIn, Math.sin(a0)*rIn);
+    g.arc(0,0, rIn, a0, a1, false);
+    g.closePath();
+    g.fill();
+    g.restore();
+  }
+  g.restore();
+}
+
+/* ---------- 4) 前景静态层 ---------- */
+function drawVignette(g){
+  const maxR = Math.hypot(W,H)/2;
+  const gr = g.createRadialGradient(cx,cy,maxR*0.35,cx,cy,maxR*1.02);
+  gr.addColorStop(0,'rgba(0,0,0,0)');
+  gr.addColorStop(0.72,'rgba(0,0,0,0.16)');
+  gr.addColorStop(1,'rgba(0,0,0,0.55)');
+  g.fillStyle = gr; g.fillRect(0,0,W,H);
+}
+function drawLetterbox(g){
+  const h = 0.045*H;
+  let lg = g.createLinearGradient(0,0,0,h);
+  lg.addColorStop(0,'rgba(0,0,0,0.60)'); lg.addColorStop(1,'rgba(0,0,0,0)');
+  g.fillStyle = lg; g.fillRect(0,0,W,h);
+  lg = g.createLinearGradient(0,H-h,0,H);
+  lg.addColorStop(0,'rgba(0,0,0,0)'); lg.addColorStop(1,'rgba(0,0,0,0.60)');
+  g.fillStyle = lg; g.fillRect(0,H-h,W,h);
+}
+function drawGrainTexture(g){
+  const w=384,h=384, img = g.createImageData(w,h), d = img.data;
+  for(let i=0;i<w*h;i++){
+    const v = 120 + Math.random()*70;
+    d[i*4]=v; d[i*4+1]=v; d[i*4+2]=v; d[i*4+3]=255;
+  }
+  g.putImageData(img,0,0);
+}
+
+// ---------- 粒子 ----------
+function initParticles(){
+  dust = [];
+  for(let i=0;i<CFG.DUST_N;i++){
+    dust.push(newDust(i));
+  }
+  ambient = [];
+  for(let i=0;i<CFG.AMBIENT_N;i++){
+    ambient.push({
+      x:Math.random()*W, y:Math.random()*H,
+      vx:rnd(-4,4), vy:rnd(-3,3),
+      s:rnd(0.6,1.7), ph:Math.random()*TAU
+    });
+  }
+}
+function newDust(i){
+  const tau = rnd(8,22);
+  const t = Math.random()*tau;
+  const r0 = 3.4 + Math.pow(Math.random(),1.6)*10.1;
+  return {
+    i, r0, a: Math.random()*TAU, t, tau,
+    r: r0*(1 - 0.5*(t/tau)*(t/tau)),   // 初始半径（修复首帧 NaN）
+    z0: rnd(-0.8,0.8), ph: Math.random()*TAU,
+    spike: Math.random()<0.05
+  };
+}
+function omega(r){ return 1.5*Math.pow(3.5/r, 1.5); }   // Kepler 近似
+
+function updateDust(dt){
+  for(const p of dust){
+    p.t += dt;
+    const r = p.r0*(1 - 0.5*(p.t/p.tau)*(p.t/p.tau));
+    if(p.t >= p.tau || r < 2.62){
+      Object.assign(p, newDust(p.i));
+      continue;
+    }
+    p.a += omega(r)*dt;
+    p.r = r;
+    p.z = p.z0*(1 - p.t/p.tau);
+  }
+}
+
+function drawDust(g, t, pass){
+  const cI = cosI;
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.lineCap = 'round';
+  for(const p of dust){
+    const r = p.r, a = p.a;
+    const sy = cy + r*Math.sin(a)*cI*RS + p.z*RS*0.35;
+    const isFar = sy < cy;
+    if((pass==='far') !== isFar) continue;
+    const sx = cx + r*Math.cos(a)*RS;
+    const w = omega(r);
+    // 速度（屏幕 px/s）：切向 + 径向吸入
+    let vx = w*r*(-Math.sin(a))*RS + Math.cos(a)*p.r0*(p.t/(p.tau*p.tau))*RS;
+    let vy = w*r*Math.cos(a)*cI*RS + Math.sin(a)*p.r0*(p.t/(p.tau*p.tau))*cI*RS;
+    const heat = clamp((13.5-r)/11, 0, 1);
+    const c = ramp(clamp((r-3)/10, 0, 1));
+    let al = (0.10 + 0.5*heat) * (0.7+0.3*Math.sin(t*3+p.ph));
+    if(isFar) al *= 0.72;
+    if(al < 0.02) continue;
+    const k = 0.05;
+    g.strokeStyle = 'rgba('+(c[0]|0)+','+(c[1]|0)+','+(c[2]|0)+','+al.toFixed(3)+')';
+    g.lineWidth = 1 + 0.7*heat;
+    g.beginPath();
+    g.moveTo(sx, sy);
+    g.lineTo(sx - vx*k, sy - vy*k);
+    g.stroke();
+    // 星芒粒子：透镜剪切（切向拉长、径向压缩）
+    if(p.spike && r < 5.6){
+      const shear = 1 + 2.4*Math.exp(-((r-2.9)*(r-2.9))/1.0);
+      const tx = -Math.sin(a), ty = Math.cos(a)*cI;
+      const rx = Math.cos(a),  ry = Math.sin(a)*cI;
+      const L = (4+3*heat)*shear;
+      g.strokeStyle = 'rgba(255,250,240,'+(0.75*heat).toFixed(3)+')';
+      g.lineWidth = 1;
+      g.beginPath();
+      g.moveTo(sx+tx*L, sy+ty*L); g.lineTo(sx-tx*L, sy-ty*L);
+      g.moveTo(sx+rx*1.5, sy+ry*1.5); g.lineTo(sx-rx*1.5, sy-ry*1.5);
+      g.stroke();
+    }
+  }
+  g.restore();
+}
+
+function drawAmbient(g, t){
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  for(const p of ambient){
+    const al = 0.05 + 0.09*(0.5+0.5*Math.sin(t*2+p.ph));
+    g.fillStyle = 'rgba(190,205,235,'+al.toFixed(3)+')';
+    g.beginPath(); g.arc(p.x,p.y,p.s,0,TAU); g.fill();
+  }
+  g.restore();
+}
+
+// ---------- 逐帧元素 ----------
+function drawShadow(g){
+  const r = CFG.SHADOW_OUT*RS;
+  const gr = g.createRadialGradient(cx,cy,0,cx,cy,r);
+  gr.addColorStop(0.00,'rgba(0,0,0,1)');
+  gr.addColorStop(0.94,'rgba(0,0,0,1)');
+  gr.addColorStop(1.00,'rgba(0,0,0,0)');
+  g.fillStyle = gr;
+  g.beginPath(); g.arc(cx,cy,r,0,TAU); g.fill();
+}
+
+function drawPhotonRing(g, t){
+  const r = CFG.PHOTON*RS;
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  const pulse = 0.85 + 0.15*Math.sin(t*0.9);
+  // 多层环
+  g.lineCap = 'round';
+  g.beginPath(); g.arc(cx,cy,r,0,TAU);
+  g.lineWidth = 0.42*RS;
+  g.strokeStyle = 'rgba(255,190,120,'+(0.10*pulse).toFixed(3)+')';
+  g.stroke();
+  g.beginPath(); g.arc(cx,cy,r,0,TAU);
+  g.lineWidth = 0.18*RS;
+  g.strokeStyle = 'rgba(255,225,180,'+(0.30*pulse).toFixed(3)+')';
+  g.stroke();
+  g.beginPath(); g.arc(cx,cy,r,0,TAU);
+  g.lineWidth = 0.075*RS;
+  g.strokeStyle = 'rgba(255,252,245,'+(0.95*pulse).toFixed(3)+')';
+  g.stroke();
+  // 微色差
+  g.beginPath(); g.arc(cx,cy,r+0.5,0,TAU);
+  g.lineWidth = 0.075*RS;
+  g.strokeStyle = 'rgba(255,70,50,0.20)';
+  g.stroke();
+  g.beginPath(); g.arc(cx,cy,r-0.5,0,TAU);
+  g.lineWidth = 0.075*RS;
+  g.strokeStyle = 'rgba(60,150,255,0.20)';
+  g.stroke();
+  // 轨道热点（吸积不稳定性）
+  for(let k=0;k<5;k++){
+    const ang = t*(1.35+0.05*k) + k*TAU/5;
+    const pu = 0.6 + 0.4*Math.sin(t*2.1 + k*1.7);
+    g.beginPath(); g.arc(cx,cy,r, ang-0.10, ang+0.10);
+    g.lineWidth = 0.20*RS;
+    g.strokeStyle = 'rgba(255,240,220,'+(0.5*pu).toFixed(3)+')';
+    g.stroke();
+    const hx = cx+Math.cos(ang)*r, hy = cy+Math.sin(ang)*r;
+    const rad = 0.30*RS*(0.8+0.4*pu);
+    const hg = g.createRadialGradient(hx,hy,0,hx,hy,rad);
+    hg.addColorStop(0,'rgba(255,230,200,'+(0.55*pu).toFixed(3)+')');
+    hg.addColorStop(1,'rgba(255,230,200,0)');
+    g.fillStyle = hg;
+    g.beginPath(); g.arc(hx,hy,rad,0,TAU); g.fill();
+  }
+  g.restore();
+}
+
+function drawDiskInnerEdge(g){
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.beginPath();
+  g.ellipse(cx,cy, CFG.DISK_IN*RS, CFG.DISK_IN*RS*cosI, 0, 0, TAU);
+  g.lineWidth = 1.6;
+  g.strokeStyle = 'rgba(255,255,255,0.55)';
+  g.stroke();
+  g.restore();
+}
+
+/* 光带：翻越黑洞顶部（流动高光） */
+function drawLightBand(g, t){
+  const A = 4.2*RS;
+  const y0 = 0.3*RS;
+  const apex = 4.6*RS + 4*Math.sin(t*0.4);   // 顶点高度（呼吸动画）
+  const Yc = (8*apex - 2*y0)/6;              // 由顶点反推贝塞尔控制点 y
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.lineCap = 'round';
+  const path = ()=>{
+    g.beginPath();
+    g.moveTo(cx-A, cy-y0);
+    g.bezierCurveTo(cx-A*0.55, cy-Yc, cx+A*0.55, cy-Yc, cx+A, cy-y0);
+  };
+  path();
+  g.lineWidth = 34; g.strokeStyle = 'rgba(255,160,90,0.10)'; g.stroke();
+  path();
+  g.lineWidth = 16; g.strokeStyle = 'rgba(255,205,150,0.28)'; g.stroke();
+  path();
+  g.lineWidth = 6;
+  g.strokeStyle = 'rgba(255,246,230,0.92)';
+  g.setLineDash([30,58]); g.lineDashOffset = -t*34;
+  g.stroke();
+  path();
+  g.lineWidth = 2;
+  g.strokeStyle = 'rgba(255,255,255,0.9)';
+  g.setLineDash([9,150]); g.lineDashOffset = -t*95;
+  g.stroke();
+  g.setLineDash([]);
+  // 两端光晕（与盘带相接处）
+  for(const s of [-1,1]){
+    const bx = cx + s*A, by = cy-y0;
+    const bg = g.createRadialGradient(bx,by,0,bx,by,0.9*RS);
+    bg.addColorStop(0,'rgba(255,220,170,0.25)');
+    bg.addColorStop(1,'rgba(255,220,170,0)');
+    g.fillStyle = bg;
+    g.beginPath(); g.arc(bx,by,0.9*RS,0,TAU); g.fill();
+  }
+  g.restore();
+}
+
+/* 飞船剪影（左下方，朝向黑洞） */
+function drawShip(g, t){
+  const bx = 0.21*W + Math.sin(t*0.11)*10;
+  const by = 0.79*H + 3*Math.sin(t*0.23+1);
+  const ang = Math.atan2(cy-by, cx-bx) + 0.02*Math.sin(t*0.4);
+  const s = (W/1920)*0.95;
+  g.save();
+  g.translate(bx,by);
+  g.rotate(ang);
+  g.scale(s,s);
+  // 引擎焰（先画，藏在机身后面）
+  g.globalCompositeOperation = 'lighter';
+  const fl = 0.30 + 0.20*Math.sin(t*9);
+  g.fillStyle = 'rgba(150,210,255,'+fl.toFixed(3)+')';
+  g.beginPath();
+  g.moveTo(-30,0); g.lineTo(-48,-3.5); g.lineTo(-48,3.5);
+  g.closePath(); g.fill();
+  g.globalCompositeOperation = 'source-over';
+  // 轮廓光（来自黑洞方向）
+  g.save();
+  g.translate(1.6,0);
+  shipPath();
+  g.lineWidth = 1.2;
+  g.strokeStyle = 'rgba(255,190,130,0.6)';
+  g.stroke();
+  g.restore();
+  // 机身
+  shipPath();
+  g.fillStyle = '#04060b';
+  g.fill();
+  // 座舱
+  const cg = g.createRadialGradient(8,-2,0,8,-2,4);
+  cg.addColorStop(0,'rgba(180,235,255,0.95)');
+  cg.addColorStop(1,'rgba(180,235,255,0)');
+  g.fillStyle = cg;
+  g.beginPath(); g.arc(8,-2,4,0,TAU); g.fill();
+  g.fillStyle = 'rgba(190,240,255,0.95)';
+  g.beginPath(); g.arc(8,-2,1.6,0,TAU); g.fill();
+  // 引擎喷口
+  const eg = g.createRadialGradient(-33,0,0,-33,0,3.5);
+  eg.addColorStop(0,'rgba(190,240,255,0.9)');
+  eg.addColorStop(1,'rgba(190,240,255,0)');
+  g.fillStyle = eg;
+  g.beginPath(); g.arc(-33,0,3.5,0,TAU); g.fill();
+  g.restore();
+
+  function shipPath(){
+    g.beginPath();
+    g.moveTo(38,0);
+    g.lineTo(10,-6); g.lineTo(-4,-5);
+    g.lineTo(-18,-18); g.lineTo(-27,-15); g.lineTo(-14,-4);
+    g.lineTo(-32,-3); g.lineTo(-34,0);
+    g.lineTo(-32,3); g.lineTo(-14,4);
+    g.lineTo(-27,15); g.lineTo(-18,18); g.lineTo(-4,5);
+    g.lineTo(10,6);
+    g.closePath();
+  }
+}
+
+/* ---------- 主渲染 ---------- */
+function render(t, dt){
+  const g = ctx;
+  // 背景：透镜化银河（缓呼吸推镜 + 1.5% 过扫防露边）
+  const sc = 1 + 0.006*Math.sin(t*0.07);
+  const ow = W*1.02, oh = H*1.02;
+  g.save();
+  g.translate(cx,cy); g.scale(sc,sc); g.translate(-cx,-cy);
+  g.drawImage(S.lensed, (W-ow)/2, (H-oh)/2, ow, oh);
+  g.restore();
+
+  // 吸积盘全盘（远侧将被阴影盖住）
+  g.drawImage(S.diskFull, 0,0, W, H);
+
+  // 远侧尘埃（画在阴影之下）
+  drawDust(g, t, 'far');
+
+  // 阴影
+  drawShadow(g);
+
+  // 近侧盘（压住阴影下缘）
+  g.drawImage(S.diskNear, 0,0, W, H);
+  drawDiskInnerEdge(g);
+
+  // 近侧尘埃
+  drawDust(g, t, 'near');
+
+  // 光子环
+  drawPhotonRing(g, t);
+
+  // 翻顶光带
+  drawLightBand(g, t);
+
+  // 飞船
+  drawShip(g, t);
+
+  // 前景：暗角 + 电影条 + 颗粒
+  g.drawImage(S.vign, 0,0, W, H);
+  g.drawImage(S.letter, 0,0, W, H);
+  drawGrainFrame(g, t);
+
+  // 前景漂浮微尘
+  drawAmbient(g, t);
+}
+
+function drawGrainFrame(g, t){
+  const w = S.grain.width, h = S.grain.height;
+  const ox = Math.floor(Math.random()*24), oy = Math.floor(Math.random()*24);
+  g.save();
+  g.globalCompositeOperation = 'overlay';
+  g.globalAlpha = 0.10;
+  for(let ty=-1; ty<2; ty++){
+    for(let tx=-1; tx<2; tx++){
+      g.drawImage(S.grain, tx*W - ox, ty*H - oy, W, H);
+    }
+  }
+  g.restore();
+}
+
+// ---------- 循环 ----------
+function loop(now){
+  const t = now/1000;
+  const dt = clamp(t - lastT, 0.001, 0.05);
+  lastT = t;
+  updateDust(dt);
+  for(const p of ambient){
+    p.x += p.vx*dt; p.y += p.vy*dt;
+    if(p.x<0) p.x+=W; if(p.x>W) p.x-=W;
+    if(p.y<0) p.y+=H; if(p.y>H) p.y-=H;
+  }
+  render(t, dt);
+  requestAnimationFrame(loop);
+}
+
+// ---------- 对外钩子 ----------
+window.__BH__ = {
+  getConfig: ()=>JSON.parse(JSON.stringify(CFG)),
+  setMode(o){
+    if(o && o.force8k !== undefined){ CFG.FORCE_8K = !!o.force8k; }
+    if(o && o.maxDpr  !== undefined){ CFG.MAX_DPR = o.maxDpr; }
+    init();
+  },
+  renderFrame: (t)=>render(t||0, 0.016),
+  reload: init
+};
+
+init();
+})();
+</script>
+</body>
+</html>
