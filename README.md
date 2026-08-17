@@ -73,8 +73,8 @@ ui-theme:
 ├── agent-presets/             # 已装配的 Agent Presets
 │   ├── router-standard/
 │   └── minimal-win/
-├── scripts/                   # 运维辅助脚本
-└── config/                    # 脱敏后的关键配置样板
+├── scripts/                   # 运维辅助脚本（含 proxy.ps1 代理自助助手）
+└── config/                    # 脱敏后的关键配置样板（含 AGENTS.md 全局规则快照）
 ```
 
 ---
