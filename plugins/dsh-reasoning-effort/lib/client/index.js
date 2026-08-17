@@ -134,7 +134,7 @@ var CSS = `
   position: absolute;
   z-index: 4;
   top: 50%;
-  left: var(--re-progress);
+  left: clamp(14px, var(--re-progress), calc(100% - 14px));
   width: 28px;
   height: 28px;
   border: 1px solid rgba(255,255,255,.94);
